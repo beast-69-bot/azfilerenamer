@@ -2,74 +2,79 @@
 File Handler - ZIP/RAR Receive & Extract
 """
 
+from __future__ import annotations
+
 import os
+import time
 from html import escape
+from pathlib import Path
+
+import aiohttp
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from config import (
-    FILES_PER_PAGE,
-    HELP_MESSAGE,
-    MAX_FILE_SIZE,
-    TEMP_DIR,
-    WELCOME_MESSAGE,
-)
+from config import FILES_PER_PAGE, MAX_FILE_SIZE, TEMP_DIR
 from utils.cleaner import TempCleaner
 from utils.extractor import ArchiveExtractor
+from utils.transfer import (
+    build_progress_bar,
+    format_eta,
+    format_size,
+    format_speed,
+    get_transfer_profile,
+)
+from utils.ui import build_archive_overview_text
 
-# Initialize utilities
+from .common import ensure_allowed_user, store
+
 extractor = ArchiveExtractor(TEMP_DIR)
 cleaner = TempCleaner(TEMP_DIR)
 
 
-def _build_overview_text(archive_name: str, file_count: int, total_size: str) -> str:
-    """Build the archive overview message."""
-    return (
-        "<b>Archive Overview</b>\n\n"
-        f"<b>Name:</b> <code>{escape(archive_name)}</code>\n"
-        f"<b>Files:</b> {file_count} files found\n"
-        f"<b>Total Size:</b> {total_size}\n\n"
-        "What would you like to do?"
-    )
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    await update.message.reply_text(
-        WELCOME_MESSAGE,
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    await update.message.reply_text(
-        HELP_MESSAGE,
-        parse_mode=ParseMode.MARKDOWN,
+def _archive_action_keyboard() -> InlineKeyboardMarkup:
+    """Build the archive action keyboard."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Show File List", callback_data="show_files_0")],
+            [
+                InlineKeyboardButton("Upload All", callback_data="upload_all"),
+                InlineKeyboardButton("Rename Files", callback_data="rename_files"),
+            ],
+            [InlineKeyboardButton("My Status", callback_data="menu_status")],
+        ]
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle incoming documents (ZIP/RAR files)."""
+    """Handle incoming ZIP/RAR documents."""
+    user_row = await ensure_allowed_user(update, context)
+    if not user_row:
+        return
+
     document = update.message.document
     user_id = update.effective_user.id
 
     file_name = (document.file_name or "").lower()
     if not (file_name.endswith(".zip") or file_name.endswith(".rar")):
-        await update.message.reply_text("Please send only ZIP or RAR files.")
+        await update.message.reply_text("Send only ZIP or RAR files.")
         return
 
     if document.file_size and document.file_size > MAX_FILE_SIZE:
         max_size_mb = MAX_FILE_SIZE / (1024 * 1024)
         await update.message.reply_text(
-            f"File is too large. Maximum supported size is {max_size_mb:.0f} MB."
+            (
+                "<b>File Too Large</b>\n\n"
+                f"The current limit is <code>{max_size_mb:.0f} MB</code> per archive."
+            ),
+            parse_mode=ParseMode.HTML,
         )
         return
 
     processing_msg = await update.message.reply_text(
-        "Downloading your file. Please wait..."
+        "<b>Processing Archive</b>\n\nDownloading your file...",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -79,9 +84,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         download_name = document.file_name or "archive"
         file = await context.bot.get_file(document.file_id)
         downloaded_path = os.path.join(user_temp_dir, download_name)
-        await file.download_to_drive(downloaded_path)
+        transfer_profile = get_transfer_profile(bool(user_row["is_premium"]))
+        await _download_file_with_progress(
+            telegram_file=file,
+            destination=downloaded_path,
+            total_bytes=document.file_size or 0,
+            progress_message=processing_msg,
+            profile_name=transfer_profile.name,
+            chunk_size=transfer_profile.download_chunk_size,
+            progress_interval=transfer_profile.progress_interval,
+        )
 
-        await processing_msg.edit_text("Extracting files. Please wait...")
+        await processing_msg.edit_text(
+            "<b>Processing Archive</b>\n\nExtracting files...",
+            parse_mode=ParseMode.HTML,
+        )
 
         success, extract_path, file_list = extractor.extract_archive(
             downloaded_path,
@@ -91,7 +108,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not success:
             await processing_msg.edit_text(
-                "Failed to extract archive. Check that the file is valid and safe."
+                (
+                    "<b>Extraction Failed</b>\n\n"
+                    "The archive could not be extracted. Check the file format and integrity."
+                ),
+                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -102,27 +123,112 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["archive_name"] = download_name
         context.user_data["downloaded_path"] = downloaded_path
 
-        keyboard = [
-            [InlineKeyboardButton("Show File List", callback_data="show_files_0")],
-            [
-                InlineKeyboardButton("Upload All", callback_data="upload_all"),
-                InlineKeyboardButton("Rename Files", callback_data="rename_files"),
-            ],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        store.increment_usage(
+            user_id,
+            archives_processed=1,
+            last_archive_name=download_name,
+        )
 
         await processing_msg.edit_text(
-            _build_overview_text(download_name, file_count, total_size),
-            reply_markup=reply_markup,
+            build_archive_overview_text(download_name, file_count, total_size),
+            reply_markup=_archive_action_keyboard(),
             parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
         print(f"Error handling document: {exc}")
-        await processing_msg.edit_text(f"Error processing file: {exc}")
+        await processing_msg.edit_text(
+            f"<b>Processing Error</b>\n\n<code>{escape(str(exc))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def _download_file_with_progress(
+    telegram_file,
+    destination: str,
+    total_bytes: int,
+    progress_message,
+    profile_name: str,
+    chunk_size: int,
+    progress_interval: float,
+):
+    """Stream a Telegram file to disk with live progress updates."""
+    url = telegram_file._get_encoded_url()
+    Path(destination).parent.mkdir(parents=True, exist_ok=True)
+
+    timeout = aiohttp.ClientTimeout(total=None, connect=30)
+    start_time = time.perf_counter()
+    last_update = 0.0
+    last_text = None
+    downloaded = 0
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            with open(destination, "wb") as file_handle:
+                async for chunk in response.content.iter_chunked(chunk_size):
+                    file_handle.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.perf_counter()
+                    if now - last_update < progress_interval:
+                        continue
+
+                    text = _build_download_progress_text(
+                        downloaded=downloaded,
+                        total_bytes=total_bytes,
+                        started_at=start_time,
+                        profile_name=profile_name,
+                    )
+                    if text != last_text:
+                        await progress_message.edit_text(text, parse_mode=ParseMode.HTML)
+                        last_text = text
+                    last_update = now
+
+    final_text = _build_download_progress_text(
+        downloaded=downloaded,
+        total_bytes=total_bytes or downloaded,
+        started_at=start_time,
+        profile_name=profile_name,
+        completed=True,
+    )
+    await progress_message.edit_text(final_text, parse_mode=ParseMode.HTML)
+
+
+def _build_download_progress_text(
+    downloaded: int,
+    total_bytes: int,
+    started_at: float,
+    profile_name: str,
+    completed: bool = False,
+) -> str:
+    """Build the download progress message."""
+    elapsed = max(time.perf_counter() - started_at, 0.001)
+    speed = downloaded / elapsed
+    eta = None
+    if total_bytes and speed > 0 and not completed:
+        eta = max(total_bytes - downloaded, 0) / speed
+
+    percent = (downloaded / total_bytes * 100) if total_bytes else 0
+    progress_bar = build_progress_bar(downloaded, total_bytes or downloaded or 1)
+    status_line = "Download complete." if completed else "Downloading your file..."
+    total_label = format_size(total_bytes or downloaded)
+
+    return (
+        "<b>Processing Archive</b>\n\n"
+        f"{status_line}\n"
+        f"<b>Mode:</b> {escape(profile_name)}\n"
+        f"<code>{progress_bar}</code> <b>{percent:.1f}%</b>\n"
+        f"<b>Downloaded:</b> <code>{format_size(downloaded)}</code> / <code>{total_label}</code>\n"
+        f"<b>Speed:</b> <code>{format_speed(speed)}</code>\n"
+        f"<b>ETA:</b> <code>{format_eta(eta)}</code>"
+    )
 
 
 async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show a paginated file list with upload buttons."""
+    if not await ensure_allowed_user(update, context):
+        return
+
     query = update.callback_query
     await query.answer()
 
@@ -130,7 +236,7 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_list = context.user_data.get("file_list", [])
 
     if not file_list:
-        await query.edit_message_text("No files found.")
+        await query.edit_message_text("No files found for this session.")
         return
 
     total_files = len(file_list)
@@ -139,21 +245,20 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_files = file_list[start_idx:end_idx]
     total_pages = (total_files + FILES_PER_PAGE - 1) // FILES_PER_PAGE
 
-    file_list_lines = [f"<b>File List</b> (Page {page + 1}/{total_pages})", ""]
+    lines = [f"<b>File List</b> ({page + 1}/{total_pages})", ""]
     keyboard = []
     row = []
 
     for file_idx, file_path in enumerate(current_files, start=start_idx):
         display_idx = file_idx + 1
         file_name = os.path.basename(file_path)
-        file_list_lines.append(f"{display_idx}. <code>{escape(file_name)}</code>")
+        lines.append(f"{display_idx}. <code>{escape(file_name)}</code>")
         row.append(
             InlineKeyboardButton(
                 f"Upload {display_idx}",
                 callback_data=f"upload_single_{file_idx}",
             )
         )
-
         if len(row) == 2:
             keyboard.append(row)
             row = []
@@ -184,14 +289,17 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await query.edit_message_text(
-        "\n".join(file_list_lines),
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.HTML,
     )
 
 
 async def back_to_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Go back to the overview message."""
+    """Go back to the archive overview."""
+    if not await ensure_allowed_user(update, context):
+        return
+
     query = update.callback_query
     await query.answer()
 
@@ -204,16 +312,8 @@ async def back_to_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extractor.get_file_info(extract_path, file_list)[1] if extract_path else "0 B"
     )
 
-    keyboard = [
-        [InlineKeyboardButton("Show File List", callback_data="show_files_0")],
-        [
-            InlineKeyboardButton("Upload All", callback_data="upload_all"),
-            InlineKeyboardButton("Rename Files", callback_data="rename_files"),
-        ],
-    ]
-
     await query.edit_message_text(
-        _build_overview_text(archive_name, file_count, total_size),
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        build_archive_overview_text(archive_name, file_count, total_size),
+        reply_markup=_archive_action_keyboard(),
         parse_mode=ParseMode.HTML,
     )

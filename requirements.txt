@@ -3,6 +3,7 @@
 
 # Telegram Bot API wrapper
 python-telegram-bot>=20.0
+aiohttp>=3.9
 
 # Archive extraction
 patool>=1.12

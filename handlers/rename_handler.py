@@ -2,6 +2,8 @@
 Rename Handler - Rename Flow & ZIP Creation
 """
 
+from __future__ import annotations
+
 import os
 from html import escape
 
@@ -13,7 +15,8 @@ from config import TEMP_DIR
 from utils.cleaner import TempCleaner
 from utils.zipper import ZipCreator
 
-# Conversation states
+from .common import ensure_allowed_user, store
+
 RENAME_LOOP = 1
 
 zip_creator = ZipCreator(TEMP_DIR)
@@ -22,12 +25,15 @@ cleaner = TempCleaner(TEMP_DIR)
 
 async def start_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the rename conversation flow."""
+    if not await ensure_allowed_user(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
     file_list = context.user_data.get("file_list", [])
     if not file_list:
-        await query.edit_message_text("No files to rename.")
+        await query.edit_message_text("No files are loaded for renaming.")
         return ConversationHandler.END
 
     context.user_data["rename_index"] = 0
@@ -38,7 +44,7 @@ async def start_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ask the user for the new name of the current file."""
+    """Ask the user for a new name for the current file."""
     file_list = context.user_data.get("original_files", [])
     rename_idx = context.user_data.get("rename_index", 0)
 
@@ -54,10 +60,10 @@ async def ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Cancel Rename", callback_data="rename_cancel")],
     ]
     message_text = (
-        f"<b>Rename Files</b> ({rename_idx + 1}/{len(file_list)})\n\n"
-        f"Current file: <code>{escape(file_name)}</code>\n\n"
-        "Type the new name for this file, or click Skip to keep the same name.\n\n"
-        f"Remaining: {remaining} files"
+        f"<b>Rename Builder</b> ({rename_idx + 1}/{len(file_list)})\n\n"
+        f"<b>Current File:</b> <code>{escape(file_name)}</code>\n"
+        "Send the new filename in chat, or tap Skip to keep the original.\n\n"
+        f"<b>Remaining:</b> <code>{remaining}</code>"
     )
 
     if update.callback_query:
@@ -78,6 +84,9 @@ async def ask_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a rename entered by the user."""
+    if not await ensure_allowed_user(update, context):
+        return ConversationHandler.END
+
     new_name = update.message.text.strip()
     if not new_name:
         await update.message.reply_text("Filename cannot be empty. Try again:")
@@ -106,6 +115,9 @@ async def handle_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def skip_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Skip renaming the current file."""
+    if not await ensure_allowed_user(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
 
@@ -123,10 +135,17 @@ async def skip_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the rename process."""
+    if not await ensure_allowed_user(update, context):
+        return ConversationHandler.END
+
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "Rename cancelled.\n\nUse /start to begin again or send a new file."
+        (
+            "<b>Rename Cancelled</b>\n\n"
+            "The archive session is still available. Send a new file or open another action."
+        ),
+        parse_mode=ParseMode.HTML,
     )
 
     context.user_data.pop("rename_index", None)
@@ -138,6 +157,9 @@ async def cancel_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def create_renamed_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Create a ZIP with renamed files and send it to the user."""
+    if not await ensure_allowed_user(update, context):
+        return ConversationHandler.END
+
     extract_path = context.user_data.get("extract_path", "")
     archive_name = context.user_data.get("archive_name", "archive.zip")
     renamed_files = context.user_data.get("renamed_files", {})
@@ -147,7 +169,7 @@ async def create_renamed_zip(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status_message = await _update_status_message(
             update,
             context,
-            "Creating ZIP with renamed files. Please wait...",
+            "<b>Rename Builder</b>\n\nCreating ZIP with renamed files...",
         )
 
         zip_path = zip_creator.create_zip(
@@ -158,13 +180,18 @@ async def create_renamed_zip(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
         zip_size = zip_creator.get_zip_size(zip_path)
-        renamed_count = sum(1 for old_path, new_path in renamed_files.items() if old_path != new_path)
+        renamed_count = sum(
+            1 for old_path, new_path in renamed_files.items() if old_path != new_path
+        )
 
         await status_message.edit_text(
-            "ZIP created.\n"
-            f"Size: {zip_size}\n"
-            f"Renamed: {renamed_count} files\n"
-            "Sending..."
+            (
+                "<b>ZIP Ready</b>\n\n"
+                f"Size: <code>{zip_size}</code>\n"
+                f"Renamed Files: <code>{renamed_count}</code>\n"
+                "Sending your rebuilt archive..."
+            ),
+            parse_mode=ParseMode.HTML,
         )
 
         with open(zip_path, "rb") as file_handle:
@@ -172,26 +199,41 @@ async def create_renamed_zip(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=update.effective_chat.id,
                 document=file_handle,
                 filename=os.path.basename(zip_path),
-                caption=f"Here is your renamed archive.\nSize: {zip_size}",
+                caption=(
+                    "<b>Renamed Archive Delivered</b>\n"
+                    f"Size: <code>{zip_size}</code>"
+                ),
+                parse_mode=ParseMode.HTML,
             )
 
         cleaner.cleanup_user_temp(user_id)
         context.user_data.clear()
+        store.increment_usage(user_id, zip_exports=1)
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="All done. Send another file to continue.",
+            text=(
+                "<b>Rename Flow Complete</b>\n\n"
+                "Your new ZIP has been sent. Upload another archive whenever you are ready."
+            ),
+            parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
         print(f"Error creating ZIP: {exc}")
+        error_text = (
+            "<b>Rename ZIP Failed</b>\n\n"
+            f"<code>{escape(str(exc))}</code>\n\nPlease try again."
+        )
         if update.callback_query:
             await update.callback_query.edit_message_text(
-                f"Error creating ZIP: {exc}\n\nPlease try again."
+                error_text,
+                parse_mode=ParseMode.HTML,
             )
         else:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"Error creating ZIP: {exc}\n\nPlease try again.",
+                text=error_text,
+                parse_mode=ParseMode.HTML,
             )
 
     return ConversationHandler.END
@@ -204,10 +246,11 @@ async def _update_status_message(
 ):
     """Edit the current bot message when possible, otherwise send a new one."""
     if update.callback_query:
-        await update.callback_query.edit_message_text(text)
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.HTML)
         return update.callback_query.message
 
     return await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
+        parse_mode=ParseMode.HTML,
     )
