@@ -47,7 +47,8 @@ TEMP_DIR = os.environ.get(
 )
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
 DATABASE_PATH = os.environ.get("DATABASE_PATH", str(DATA_DIR / "bot.db"))
-MAX_FILE_SIZE = 50 * 1024 * 1024
+FREE_MAX_FILE_SIZE = 1024 * 1024 * 1024
+PREMIUM_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 FILES_PER_PAGE = 20
 
 UPLOAD_DELAY = 1

@@ -15,7 +15,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from config import FILES_PER_PAGE, MAX_FILE_SIZE, TEMP_DIR
+from config import FILES_PER_PAGE, FREE_MAX_FILE_SIZE, PREMIUM_MAX_FILE_SIZE, TEMP_DIR
 from utils.cleaner import TempCleaner
 from utils.extractor import ArchiveExtractor
 from utils.transfer import (
@@ -55,18 +55,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     document = update.message.document
     user_id = update.effective_user.id
+    max_file_size = PREMIUM_MAX_FILE_SIZE if user_row["is_premium"] else FREE_MAX_FILE_SIZE
 
     file_name = (document.file_name or "").lower()
     if not (file_name.endswith(".zip") or file_name.endswith(".rar")):
         await update.message.reply_text("Send only ZIP or RAR files.")
         return
 
-    if document.file_size and document.file_size > MAX_FILE_SIZE:
-        max_size_mb = MAX_FILE_SIZE / (1024 * 1024)
+    if document.file_size and document.file_size > max_file_size:
+        max_size_gb = max_file_size / (1024 * 1024 * 1024)
+        plan_name = "Premium" if user_row["is_premium"] else "Free"
         await update.message.reply_text(
             (
                 "<b>File Too Large</b>\n\n"
-                f"The current limit is <code>{max_size_mb:.0f} MB</code> per archive."
+                f"<b>Your Plan:</b> {plan_name}\n"
+                f"<b>Archive Limit:</b> <code>{max_size_gb:.0f} GB</code>\n"
+                "Upgrade to premium if you need the higher limit."
             ),
             parse_mode=ParseMode.HTML,
         )

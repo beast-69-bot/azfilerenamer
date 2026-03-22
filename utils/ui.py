@@ -92,6 +92,7 @@ def build_help_text(is_admin: bool) -> str:
 def build_plan_text(user_row) -> str:
     """Build the plan screen for a user."""
     current_plan = plan_name(user_row)
+    archive_limit = "2 GB" if user_row["is_premium"] else "1 GB"
     perks = (
         "Priority transfer lane is active with faster download chunks and concurrent uploads."
         if user_row["is_premium"]
@@ -100,6 +101,7 @@ def build_plan_text(user_row) -> str:
     return (
         "<b>Plan Center</b>\n\n"
         f"<b>Current Plan:</b> {current_plan}\n"
+        f"<b>Archive Limit:</b> {archive_limit}\n"
         f"<b>Premium Since:</b> {_safe(user_row['premium_since']) if user_row['premium_since'] else 'Not active'}\n\n"
         "<b>Plan Notes</b>\n"
         f"{perks}\n\n"
