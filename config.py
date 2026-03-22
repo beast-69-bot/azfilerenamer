@@ -34,12 +34,22 @@ def _parse_admin_ids(raw_value: str) -> set[int]:
     return admin_ids
 
 
+def _parse_bool(raw_value: str | None, default: bool = False) -> bool:
+    """Parse a boolean environment value."""
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 _load_dotenv_file()
 
 BASE_DIR = Path(__file__).resolve().parent
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
+BOT_API_BASE_URL = os.environ.get("BOT_API_BASE_URL", "https://api.telegram.org/bot")
+BOT_API_BASE_FILE_URL = os.environ.get("BOT_API_BASE_FILE_URL", "https://api.telegram.org/file/bot")
+BOT_API_LOCAL_MODE = _parse_bool(os.environ.get("BOT_API_LOCAL_MODE"), default=False)
 
 TEMP_DIR = os.environ.get(
     "TEMP_DIR",

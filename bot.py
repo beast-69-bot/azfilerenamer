@@ -16,7 +16,12 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN
+from config import (
+    BOT_API_BASE_FILE_URL,
+    BOT_API_BASE_URL,
+    BOT_API_LOCAL_MODE,
+    BOT_TOKEN,
+)
 from handlers import (
     RENAME_LOOP,
     add_premium_command,
@@ -71,7 +76,14 @@ def main():
 
     print("Starting Telegram File Manager Bot...")
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .base_url(BOT_API_BASE_URL)
+        .base_file_url(BOT_API_BASE_FILE_URL)
+        .local_mode(BOT_API_LOCAL_MODE)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
