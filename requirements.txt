@@ -1,0 +1,12 @@
+# Telegram File Manager Bot - Requirements
+# Python 3.10+ recommended
+
+# Telegram Bot API wrapper
+python-telegram-bot>=20.0
+
+# Archive extraction
+patool>=1.12
+rarfile>=4.0
+
+# Note: For RAR extraction on Termux, install unrar:
+# apt install unrar
