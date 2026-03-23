@@ -4,6 +4,7 @@ File Handler - ZIP/RAR Receive & Extract
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from html import escape
@@ -13,6 +14,7 @@ import aiohttp
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from config import FILES_PER_PAGE, FREE_MAX_FILE_SIZE, PREMIUM_MAX_FILE_SIZE, TEMP_DIR
@@ -37,12 +39,12 @@ def _archive_action_keyboard() -> InlineKeyboardMarkup:
     """Build the archive action keyboard."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Show File List", callback_data="show_files_0")],
+            [InlineKeyboardButton("📋 Show File List", callback_data="show_files_0")],
             [
-                InlineKeyboardButton("Upload All", callback_data="upload_all"),
-                InlineKeyboardButton("Rename Files", callback_data="rename_files"),
+                InlineKeyboardButton("📤 Upload All", callback_data="upload_all"),
+                InlineKeyboardButton("✏️ Rename Files", callback_data="rename_files"),
             ],
-            [InlineKeyboardButton("My Status", callback_data="menu_status")],
+            [InlineKeyboardButton("📊 My Status", callback_data="menu_status")],
         ]
     )
 
@@ -59,7 +61,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_name = (document.file_name or "").lower()
     if not (file_name.endswith(".zip") or file_name.endswith(".rar")):
-        await update.message.reply_text("Send only ZIP or RAR files.")
+        await update.message.reply_text(
+            "⚠️ <b>Unsupported Format</b>\n\nPlease send a <b>ZIP</b> or <b>RAR</b> file only.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if document.file_size and document.file_size > max_file_size:
@@ -67,17 +72,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         plan_name = "Premium" if user_row["is_premium"] else "Free"
         await update.message.reply_text(
             (
-                "<b>File Too Large</b>\n\n"
+                "❌ <b>File Too Large</b>\n\n"
                 f"<b>Your Plan:</b> {plan_name}\n"
-                f"<b>Archive Limit:</b> <code>{max_size_gb:.0f} GB</code>\n"
-                "Upgrade to premium if you need the higher limit."
+                f"<b>Archive Limit:</b> <code>{max_size_gb:.0f} GB</code>\n\n"
+                "Upgrade to premium for a higher limit."
             ),
             parse_mode=ParseMode.HTML,
         )
         return
 
     processing_msg = await update.message.reply_text(
-        "<b>Processing Archive</b>\n\nDownloading your file...",
+        "⏳ <b>Processing Archive</b>\n\n⬇️ Downloading your file...",
         parse_mode=ParseMode.HTML,
     )
 
@@ -85,8 +90,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cleaner.cleanup_user_temp(user_id)
         user_temp_dir = cleaner.create_user_temp_dir(user_id)
 
-        download_name = document.file_name or "archive"
-        file = await context.bot.get_file(document.file_id)
+        download_name = os.path.basename(document.file_name) if document.file_name else "archive"
+        file = await context.bot.get_file(document.file_id, read_timeout=3600, write_timeout=3600)
         downloaded_path = os.path.join(user_temp_dir, download_name)
         transfer_profile = get_transfer_profile(bool(user_row["is_premium"]))
         await _download_file_with_progress(
@@ -99,24 +104,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             progress_interval=transfer_profile.progress_interval,
         )
 
-        await processing_msg.edit_text(
-            "<b>Processing Archive</b>\n\nExtracting files...",
-            parse_mode=ParseMode.HTML,
+        await _safe_edit(
+            processing_msg,
+            "⏳ <b>Processing Archive</b>\n\n📦 Extracting files...",
         )
 
-        success, extract_path, file_list = extractor.extract_archive(
+        success, extract_path, file_list = await asyncio.to_thread(
+            extractor.extract_archive,
             downloaded_path,
             user_id,
             download_name,
         )
 
         if not success:
-            await processing_msg.edit_text(
+            await _safe_edit(
+                processing_msg,
                 (
-                    "<b>Extraction Failed</b>\n\n"
-                    "The archive could not be extracted. Check the file format and integrity."
+                    "❌ <b>Extraction Failed</b>\n\n"
+                    "The archive could not be extracted.\n"
+                    "Please check the file format and integrity."
                 ),
-                parse_mode=ParseMode.HTML,
             )
             return
 
@@ -133,17 +140,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_archive_name=download_name,
         )
 
-        await processing_msg.edit_text(
+        await _safe_edit(
+            processing_msg,
             build_archive_overview_text(download_name, file_count, total_size),
             reply_markup=_archive_action_keyboard(),
-            parse_mode=ParseMode.HTML,
         )
     except Exception as exc:
         print(f"Error handling document: {exc}")
-        await processing_msg.edit_text(
-            f"<b>Processing Error</b>\n\n<code>{escape(str(exc))}</code>",
-            parse_mode=ParseMode.HTML,
+        await _safe_edit(
+            processing_msg,
+            f"❌ <b>Processing Error</b>\n\n<code>{escape(str(exc))}</code>",
         )
+
+
+async def _safe_edit(message, text: str, reply_markup=None) -> None:
+    """Edit a message, silently swallowing Telegram API errors."""
+    try:
+        await message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except TelegramError:
+        pass
 
 
 async def _download_file_with_progress(
@@ -184,8 +203,11 @@ async def _download_file_with_progress(
                         profile_name=profile_name,
                     )
                     if text != last_text:
-                        await progress_message.edit_text(text, parse_mode=ParseMode.HTML)
-                        last_text = text
+                        try:
+                            await progress_message.edit_text(text, parse_mode=ParseMode.HTML)
+                            last_text = text
+                        except TelegramError:
+                            pass
                     last_update = now
 
     final_text = _build_download_progress_text(
@@ -195,7 +217,10 @@ async def _download_file_with_progress(
         profile_name=profile_name,
         completed=True,
     )
-    await progress_message.edit_text(final_text, parse_mode=ParseMode.HTML)
+    try:
+        await progress_message.edit_text(final_text, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
 
 
 def _build_download_progress_text(
@@ -214,11 +239,11 @@ def _build_download_progress_text(
 
     percent = (downloaded / total_bytes * 100) if total_bytes else 0
     progress_bar = build_progress_bar(downloaded, total_bytes or downloaded or 1)
-    status_line = "Download complete." if completed else "Downloading your file..."
+    status_line = "✅ Download complete." if completed else "⬇️ Downloading your file..."
     total_label = format_size(total_bytes or downloaded)
 
     return (
-        "<b>Processing Archive</b>\n\n"
+        "⏳ <b>Processing Archive</b>\n\n"
         f"{status_line}\n"
         f"<b>Mode:</b> {escape(profile_name)}\n"
         f"<code>{progress_bar}</code> <b>{percent:.1f}%</b>\n"
@@ -240,7 +265,7 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_list = context.user_data.get("file_list", [])
 
     if not file_list:
-        await query.edit_message_text("No files found for this session.")
+        await query.edit_message_text("No files found for this session.\n\nPlease send a new archive.")
         return
 
     total_files = len(file_list)
@@ -249,7 +274,7 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_files = file_list[start_idx:end_idx]
     total_pages = (total_files + FILES_PER_PAGE - 1) // FILES_PER_PAGE
 
-    lines = [f"<b>File List</b> ({page + 1}/{total_pages})", ""]
+    lines = [f"📋 <b>File List</b> ({page + 1}/{total_pages})", ""]
     keyboard = []
     row = []
 
@@ -259,11 +284,11 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{display_idx}. <code>{escape(file_name)}</code>")
         row.append(
             InlineKeyboardButton(
-                f"Upload {display_idx}",
+                f"📤 {display_idx}",
                 callback_data=f"upload_single_{file_idx}",
             )
         )
-        if len(row) == 2:
+        if len(row) == 3:
             keyboard.append(row)
             row = []
 
@@ -273,23 +298,23 @@ async def show_file_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nav_buttons = []
     if page > 0:
         nav_buttons.append(
-            InlineKeyboardButton("Prev", callback_data=f"show_files_{page - 1}")
+            InlineKeyboardButton("⬅️ Prev", callback_data=f"show_files_{page - 1}")
         )
     if end_idx < total_files:
         nav_buttons.append(
-            InlineKeyboardButton("Next", callback_data=f"show_files_{page + 1}")
+            InlineKeyboardButton("Next ➡️", callback_data=f"show_files_{page + 1}")
         )
     if nav_buttons:
         keyboard.append(nav_buttons)
 
     keyboard.append(
         [
-            InlineKeyboardButton("Upload All", callback_data="upload_all"),
-            InlineKeyboardButton("Rename Files", callback_data="rename_files"),
+            InlineKeyboardButton("📤 Upload All", callback_data="upload_all"),
+            InlineKeyboardButton("✏️ Rename Files", callback_data="rename_files"),
         ]
     )
     keyboard.append(
-        [InlineKeyboardButton("Back to Overview", callback_data="back_overview")]
+        [InlineKeyboardButton("🔙 Back to Overview", callback_data="back_overview")]
     )
 
     await query.edit_message_text(
@@ -311,10 +336,16 @@ async def back_to_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archive_name = context.user_data.get("archive_name", "Unknown")
     extract_path = context.user_data.get("extract_path", "")
 
+    if not file_list or not extract_path:
+        await query.edit_message_text(
+            "⚠️ <b>Session Expired</b>\n\n"
+            "No archive data found. Please send a new file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     file_count = len(file_list)
-    total_size = (
-        extractor.get_file_info(extract_path, file_list)[1] if extract_path else "0 B"
-    )
+    total_size = extractor.get_file_info(extract_path, file_list)[1]
 
     await query.edit_message_text(
         build_archive_overview_text(archive_name, file_count, total_size),

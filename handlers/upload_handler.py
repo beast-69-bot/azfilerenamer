@@ -11,6 +11,7 @@ from html import escape
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from utils.extractor import ArchiveExtractor
@@ -26,6 +27,9 @@ from .common import ensure_allowed_user, store
 
 extractor = ArchiveExtractor("")
 
+# Telegram send_document timeouts for large files
+_SEND_TIMEOUT = dict(read_timeout=3600, write_timeout=3600)
+
 
 async def upload_single_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Upload a single file based on callback data."""
@@ -40,23 +44,45 @@ async def upload_single_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_list = context.user_data.get("file_list", [])
     extract_path = context.user_data.get("extract_path", "")
 
-    if not file_list or file_idx >= len(file_list):
-        await query.edit_message_text("File not found.")
+    if not file_list or not extract_path:
+        await query.edit_message_text(
+            "⚠️ <b>Session Expired</b>\n\n"
+            "No archive data found. Please send a new file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if file_idx >= len(file_list):
+        await query.edit_message_text(
+            "⚠️ File not found. It may have been cleaned up.\n\nSend a new archive to start again.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     file_path = file_list[file_idx]
     full_path = extractor.get_full_path(extract_path, file_path)
     file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(full_path) if os.path.exists(full_path) else 0
+
+    if not os.path.exists(full_path):
+        await query.edit_message_text(
+            f"⚠️ <b>File Missing</b>\n\n"
+            f"<code>{escape(file_name)}</code> was not found on disk.\n"
+            "Temp files may have been cleaned. Send a new archive.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    file_size = os.path.getsize(full_path)
     transfer_profile = get_transfer_profile(bool(user_row["is_premium"]))
 
     try:
         await query.edit_message_text(
             (
-                "<b>Single Upload</b>\n\n"
+                "📤 <b>Uploading File</b>\n\n"
                 f"<b>Mode:</b> {escape(transfer_profile.name)}\n"
-                f"Uploading <code>{escape(file_name)}</code>...\n"
-                f"<b>Size:</b> <code>{format_size(file_size)}</code>"
+                f"<b>File:</b> <code>{escape(file_name)}</code>\n"
+                f"<b>Size:</b> <code>{format_size(file_size)}</code>\n\n"
+                "⏳ Uploading to Telegram..."
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -67,8 +93,9 @@ async def upload_single_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=update.effective_chat.id,
                 document=file_handle,
                 filename=file_name,
-                caption=f"Uploaded <code>{escape(file_name)}</code> successfully.",
+                caption=f"✅ <code>{escape(file_name)}</code>",
                 parse_mode=ParseMode.HTML,
+                **_SEND_TIMEOUT,
             )
         elapsed = max(time.perf_counter() - started_at, 0.001)
 
@@ -76,11 +103,22 @@ async def upload_single_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         await query.edit_message_text(
             (
-                "<b>Single Upload Complete</b>\n\n"
-                f"<code>{escape(file_name)}</code> was sent successfully.\n"
+                "✅ <b>Upload Complete</b>\n\n"
+                f"<b>File:</b> <code>{escape(file_name)}</code>\n"
                 f"<b>Size:</b> <code>{format_size(file_size)}</code>\n"
-                f"<b>Average Speed:</b> <code>{format_speed(file_size / elapsed)}</code>\n"
+                f"<b>Speed:</b> <code>{format_speed(file_size / elapsed)}</code>\n"
                 f"<b>Time:</b> <code>{elapsed:.1f}s</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError as exc:
+        print(f"Upload error: {exc}")
+        await query.edit_message_text(
+            (
+                "❌ <b>Upload Failed</b>\n\n"
+                f"<b>File:</b> <code>{escape(file_name)}</code>\n"
+                f"<b>Reason:</b> <code>{escape(str(exc))}</code>\n\n"
+                "Try again or send a new archive."
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -88,9 +126,9 @@ async def upload_single_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
         print(f"Upload error: {exc}")
         await query.edit_message_text(
             (
-                "<b>Upload Failed</b>\n\n"
-                f"File: <code>{escape(file_name)}</code>\n"
-                f"Reason: <code>{escape(str(exc))}</code>"
+                "❌ <b>Upload Failed</b>\n\n"
+                f"<b>File:</b> <code>{escape(file_name)}</code>\n"
+                f"<b>Reason:</b> <code>{escape(str(exc))}</code>"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -108,25 +146,50 @@ async def upload_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_list = context.user_data.get("file_list", [])
     extract_path = context.user_data.get("extract_path", "")
 
-    if not file_list:
-        await query.edit_message_text("No files to upload.")
+    if not file_list or not extract_path:
+        await query.edit_message_text(
+            "⚠️ <b>Session Expired</b>\n\n"
+            "No archive data found. Please send a new file.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     transfer_profile = get_transfer_profile(bool(user_row["is_premium"]))
+
+    # Filter out missing files upfront
     upload_items = []
+    skipped = 0
     for file_path in file_list:
         full_path = extractor.get_full_path(extract_path, file_path)
-        size_bytes = os.path.getsize(full_path) if os.path.exists(full_path) else 0
+        if not os.path.exists(full_path):
+            skipped += 1
+            continue
+        size_bytes = os.path.getsize(full_path)
         upload_items.append((file_path, full_path, size_bytes))
 
-    total_files = len(file_list)
+    if not upload_items:
+        await query.edit_message_text(
+            "⚠️ <b>No Files Available</b>\n\n"
+            "All extracted files have been cleaned up.\n"
+            "Please send a new archive.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_files = len(upload_items)
     total_bytes = sum(size for _, _, size in upload_items)
+
+    skip_note = f"\n⚠️ Skipped {skipped} missing file(s)." if skipped else ""
+
     await query.edit_message_text(
         (
-            "<b>Bulk Upload Started</b>\n\n"
+            "📤 <b>Bulk Upload Started</b>\n\n"
             f"<b>Mode:</b> {escape(transfer_profile.name)}\n"
             f"<b>Concurrency:</b> <code>{transfer_profile.upload_concurrency}</code>\n"
+            f"<b>Total Files:</b> <code>{total_files}</code>\n"
+            f"<b>Total Size:</b> <code>{format_size(total_bytes)}</code>\n"
             f"Progress: <code>0/{total_files}</code>"
+            f"{skip_note}"
         ),
         parse_mode=ParseMode.HTML,
     )
@@ -156,6 +219,7 @@ async def upload_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=update.effective_chat.id,
                         document=file_handle,
                         filename=file_name,
+                        **_SEND_TIMEOUT,
                     )
                 async with state_lock:
                     state["uploaded_count"] += 1
@@ -164,14 +228,18 @@ async def upload_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 print(f"Upload error for {file_name}: {exc}")
                 async with state_lock:
                     state["failed_count"] += 1
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=(
-                        "<b>One File Failed</b>\n\n"
-                        f"<code>{escape(file_name)}</code> could not be uploaded."
-                    ),
-                    parse_mode=ParseMode.HTML,
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=(
+                            "⚠️ <b>Upload Failed</b>\n\n"
+                            f"<code>{escape(file_name)}</code> could not be uploaded.\n"
+                            f"<code>{escape(str(exc)[:200])}</code>"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    pass
             finally:
                 async with state_lock:
                     if file_name in state["active_files"]:
@@ -192,8 +260,11 @@ async def upload_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     started_at=started_at,
                 )
             if text != last_text:
-                await status_message.edit_text(text, parse_mode=ParseMode.HTML)
-                last_text = text
+                try:
+                    await status_message.edit_text(text, parse_mode=ParseMode.HTML)
+                    last_text = text
+                except TelegramError:
+                    pass
 
             if all(task.done() for task in tasks):
                 break
@@ -211,16 +282,21 @@ async def upload_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elapsed = max(time.perf_counter() - started_at, 0.001)
+    avg_speed = state["uploaded_bytes"] / elapsed if state["uploaded_bytes"] else 0
     summary = (
-        "<b>Bulk Upload Complete</b>\n\n"
+        "✅ <b>Bulk Upload Complete</b>\n\n"
         f"<b>Mode:</b> {escape(transfer_profile.name)}\n"
-        f"Total Files: <code>{total_files}</code>\n"
-        f"Uploaded: <code>{state['uploaded_count']}</code>\n"
-        f"Failed: <code>{state['failed_count']}</code>\n"
-        f"Uploaded Size: <code>{format_size(state['uploaded_bytes'])}</code>\n"
-        f"Average Speed: <code>{format_speed(state['uploaded_bytes'] / elapsed)}</code>"
+        f"<b>Total Files:</b> <code>{total_files}</code>\n"
+        f"<b>Uploaded:</b> <code>{state['uploaded_count']}</code>\n"
+        f"<b>Failed:</b> <code>{state['failed_count']}</code>\n"
+        f"<b>Transferred:</b> <code>{format_size(state['uploaded_bytes'])}</code>\n"
+        f"<b>Avg Speed:</b> <code>{format_speed(avg_speed)}</code>\n"
+        f"<b>Time:</b> <code>{elapsed:.1f}s</code>"
     )
-    await status_message.edit_text(summary, parse_mode=ParseMode.HTML)
+    try:
+        await status_message.edit_text(summary, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        pass
 
 
 def _build_bulk_upload_status_text(
@@ -236,12 +312,12 @@ def _build_bulk_upload_status_text(
     speed = state["uploaded_bytes"] / elapsed
     remaining_bytes = max(total_bytes - state["uploaded_bytes"], 0)
     eta = remaining_bytes / speed if speed > 0 else None
-    active_preview = ", ".join(state["active_files"][:2]) if state["active_files"] else "Waiting"
+    active_preview = ", ".join(state["active_files"][:2]) if state["active_files"] else "Waiting..."
     progress_bar = build_progress_bar(completed_files, total_files or 1)
     percent = (completed_files / total_files * 100) if total_files else 0
 
     return (
-        "<b>Bulk Upload Running</b>\n\n"
+        "📤 <b>Bulk Upload Running</b>\n\n"
         f"<b>Mode:</b> {escape(profile_name)}\n"
         f"<code>{progress_bar}</code> <b>{percent:.1f}%</b>\n"
         f"<b>Files:</b> <code>{completed_files}/{total_files}</code>\n"
